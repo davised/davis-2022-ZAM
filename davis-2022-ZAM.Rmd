@@ -1,0 +1,1513 @@
+---
+title: "ZAM Studies manuscript"
+author: "Ed Davis"
+date: "3/23/2022"
+output: html_document
+---
+
+Output here may have slight differences from the publication due to the
+non-stochastic nature of several of the commands, including the rarefaction,
+the permutation tests, and others.
+
+```{r setup, include=FALSE}
+library(here)
+library(phyloseq)
+library(tidyverse)
+library(future)
+library(furrr)
+library(MASS)
+library(rstatix)
+library(cowplot)
+library(vegan)
+library(ggpubr)
+library(lme4)
+source(here("scripts/xgfs_colors.R"))
+source(here("scripts/plot_functions.R"))
+plan(multiprocess, workers = 6)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r set globals, include=FALSE}
+old_color <- RColorBrewer::brewer.pal(5, 'Blues')[3]
+young_color <- RColorBrewer::brewer.pal(5, 'Oranges')[3]
+age_colors <- c(old = old_color,
+                young = young_color)
+old_agexstudy_colors <- RColorBrewer::brewer.pal(5, 'Blues')[c(2,4)]
+young_agexstudy_colors <- RColorBrewer::brewer.pal(5, 'Oranges')[c(2,4)]
+agexstudy_ann_colors <- c(old_ZAM1 = old_agexstudy_colors[1], 
+                          old_ZAM2 = old_agexstudy_colors[2], 
+                          young_ZAM1 = young_agexstudy_colors[1],
+                          young_ZAM2 = young_agexstudy_colors[2])
+diet_ann_colors <- RColorBrewer::brewer.pal(6, 'Set2')[4:6]
+names(diet_ann_colors) <- c('deficient', 'supplemented', 'adequate')
+old_agexdietxstudy_colors <- RColorBrewer::brewer.pal(5, 'Blues')[c(2:5)]
+young_agexdietxstudy_colors <- RColorBrewer::brewer.pal(5, 'Oranges')[c(2:5)]
+agexdietxstudy_colors <- c(OZD_ZAM2 = old_agexdietxstudy_colors[1],
+                           OZA_ZAM2 = old_agexdietxstudy_colors[2],
+                           OZA_ZAM1 = old_agexdietxstudy_colors[3],
+                           OZS_ZAM1 = old_agexdietxstudy_colors[4],
+                           YZD_ZAM2 = young_agexdietxstudy_colors[1],
+                           YZA_ZAM2 = young_agexdietxstudy_colors[2],
+                           YZA_ZAM1 = young_agexdietxstudy_colors[3],
+                           YZS_ZAM1 = young_agexdietxstudy_colors[4])
+agexstudy_ann_colors <- c(old_ZAM1 = old_agexstudy_colors[1], 
+                          old_ZAM2 = old_agexstudy_colors[2], 
+                          young_ZAM1 = young_agexstudy_colors[1],
+                          young_ZAM2 = young_agexstudy_colors[2])
+agexdietxstudy_order.young <- c('YZD_ZAM2', 'YZA_ZAM2', 'YZA_ZAM1', 'YZS_ZAM1')
+agexdietxstudy_order.old <- c('OZD_ZAM2', 'OZA_ZAM2', 'OZA_ZAM1', 'OZS_ZAM1') 
+agexdietxstudy_order <- c(agexdietxstudy_order.young,
+                          agexdietxstudy_order.old)
+```
+
+```{r run_and_read_deicode, include=FALSE}
+run_deicode <- function(otus, runid) {
+  deicode <- '/home/davised/.local/bin/deicode'
+  coda.biom <- otus %>%
+    t() %>%
+    biomformat::make_biom(id = runid,
+                          matrix_element_type = 'int')
+  rpca.dir <- paste0('rpca-', runid)
+  dir.create(rpca.dir)
+  rpca.biom <- file.path(rpca.dir, paste0(runid, '.biom'))
+  coda.biom %>%
+    biomformat::write_biom(rpca.biom)
+  # Run and load
+  paste(deicode, "auto-rpca ", 
+        "--in-biom", rpca.biom, 
+        "--output-dir", rpca.dir) %>%
+    system() # change to echo() or message()
+  return(rpca.dir)
+}
+run_claatu <- function(phytree.fh,
+                       ps.ctu,
+                       outpath = "claatu_output",
+                       claatu_venv_dir = "~/claatu") {
+  # load libraries and venv
+  library('phyloseq')
+  library('tidyverse')
+  library('reticulate')
+  use_virtualenv(claatu_venv_dir)
+  
+  # get bin paths
+  prep_tree <- file.path(claatu_venv_dir, "bin", "prep_tree.py")
+  count_tree <- file.path(claatu_venv_dir, "bin", "count_tree.py")
+  tax_convert <- file.path(claatu_venv_dir, "bin",
+                       "dada2_tax_convert.pl")
+  clade_stat <- file.path(claatu_venv_dir, "bin", "clade_stat.py")
+  node_info <- file.path(claatu_venv_dir, "bin", "node_info.py")
+  tax_parser <- file.path(claatu_venv_dir, "bin", "tax_parser.py")
+  python2 <- file.path(claatu_venv_dir, "bin", "python2")
+  newtree <- "new_prepped_tree.tre"
+  newtax <- "tax_tab_conv.tab"
+  newasvs <- "rarefied.tab"
+  
+  # set dir
+  dir.create(outpath)
+  setwd(outpath)
+  
+  # get asv and tax tables
+  depth <- ps.ctu %>%
+    sample_sums() %>%
+    min()
+  ps.ctu %>% otu_table() %>%
+    data.frame() %>%
+    vegan::rrarefy(depth) %>%
+    t() %>%
+    data.frame() %>%
+    as_tibble(rownames = "#OTU") %>%
+    write_tsv(newasvs)
+  ps.ctu %>% tax_table() %>%
+    data.frame() %>%
+    write.table("tax_tab_raw.tab", quote = F, sep = "\t")
+  
+  # prep tree
+  paste(python2, prep_tree, phytree.fh) %>%
+    system()
+  
+  # convert tax table
+  paste("perl", tax_convert, "tax_tab_raw.tab", "|",
+        "sed", "'s/g__NA;/g__;/'", ">", newtax) %>%
+    system()
+  
+  paste(python2, clade_stat, newtree, newtax, ".", "-p clades") %>%
+    system()
+  
+  paste(python2, tax_parser, 
+        "clades_nodes2tax.txt", "tax_clades.txt" ) %>%
+    system()
+  
+  paste(python2, node_info, newtree, ".") %>%
+    system()
+  
+  # count
+  
+  paste(python2, count_tree, newasvs, newtree, "counts_rare.tab") %>%
+    system()
+}
+read_rpca_ord <- function(rpca.ord.fh, coda.meta, coda.taxa) {
+  lines <- readLines(rpca.ord.fh)
+  i <- cumsum(lines == '')
+  ord.groups <- factor(i, labels = c('eigvals', 'proportion', 'species', 'sites',
+                                    'biplot',  'site_constraints') )
+  PC.names <- c('PC1', 'PC2', 'PC3')
+  lines.split <- lines %>%
+    split(ord.groups)
+  lines.split$eigvals <- lines.split$eigvals[2] %>%
+    strsplit('\t', fixed = TRUE) %>%
+    unlist() %>%
+    as.numeric() %>%
+    setNames(PC.names)
+  lines.split$proportion <- lines.split$proportion[3] %>%
+    strsplit('\t', fixed = TRUE) %>%
+    unlist() %>%
+    as.numeric() %>%
+    setNames(PC.names)
+  tmp <- lines.split$species[-c(1, 2)] %>%
+    strsplit('\t', TRUE)
+  lines.split$species <- lapply(tmp, rbind) %>%
+    Reduce(rbind, .) %>%
+    data.frame(stringsAsFactors = F) %>%
+    magrittr::set_colnames(c('ASV', PC.names)) %>%
+    type_convert()
+  tmp <- lines.split$sites[-c(1, 2)] %>%
+    strsplit('\t', TRUE)
+  lines.split$sites <- lapply(tmp, rbind) %>%
+    Reduce(rbind, .) %>%
+    data.frame(stringsAsFactors = F) %>%
+    magrittr::set_colnames(c('Sample', PC.names)) %>%
+    type_convert()
+  lines.split <- lines.split %>%
+    within(rm('biplot', 'site_constraints'))
+  rpca.ord <- lines.split
+  
+  rpca.ord$species <- rpca.ord$species %>%
+    merge(coda.taxa, by = 'ASV', sort = FALSE)
+  rpca.ord$species
+  rpca.ord$sites <- rpca.ord$sites %>%
+    merge(coda.meta, by = 'Sample', sort = FALSE)
+  return(rpca.ord)
+}
+
+plot_rpca_ord <- function(rpca.ord, flip_x_axis = FALSE, flip_y_axis = FALSE, 
+                          species = TRUE, fill = 'agexstudy',
+                          ann_colors = agexstudy_ann_colors) {
+  
+  impt_taxa <- rpca.ord$species$ASV[which(abs(rpca.ord$species$PC1) > 0.10)]
+  x_flip <- 1
+  y_flip <- 1
+  if (flip_x_axis) {
+    x_flip <- (-1)
+  }
+  if (flip_y_axis) {
+    y_flip <- (-1)
+  }
+  
+  fill = sym(fill)
+  rpca.ord.plot <- rpca.ord$sites %>%
+    ggplot(aes(x = PC1 * x_flip, y = PC2 * y_flip, fill = !!fill)) +
+    theme_cowplot() +
+    theme(legend.title = element_blank()) +
+    geom_point(size = 3, shape = 21, color = 'dimgray') + 
+    scale_color_manual(values = ann_colors,
+                       aesthetics = c('color', 'fill')) +
+    scale_shape_manual(values = c(21)) + 
+    xlab(paste0('PC1', 
+               ' [', 
+               sprintf(rpca.ord$proportion['PC1']*100, fmt = '%.2f'),
+               ' %]')) +
+    ylab(paste0('PC2',
+               ' [', 
+               sprintf(rpca.ord$proportion['PC2']*100, fmt = '%.2f'),
+               ' %]')) +
+    guides(fill=guide_legend(override.aes=list(shape=21))) +
+    stat_ellipse(aes(color = !!fill)) 
+  if (species) {
+    rpca.ord.plot <- rpca.ord.plot +
+      geom_segment(data = subset(rpca.ord$species, ASV %in% impt_taxa), 
+                   inherit.aes = F, 
+                   mapping = aes(x = 0, y = 0, xend = PC1 * x_flip, 
+                                 yend = PC2 * y_flip,
+                                 alpha = 0.95),
+                   color = 'red1', linetype = 'dashed', 
+                   arrow = arrow(length = unit(1/2, "picas"),
+                                 type = 'closed'),
+                   show.legend = F) +
+      ggrepel::geom_text_repel(data = subset(rpca.ord$species, ASV %in% impt_taxa), 
+                      inherit.aes = F, size = 3.5,
+                      mapping = aes(x = PC1 * x_flip, y = PC2 * y_flip, label = Genus))
+  }
+  return(list(impt_taxa = impt_taxa,
+              rpca.ord.plot = rpca.ord.plot))
+}
+```
+
+```{r load_data, cache=TRUE}
+seqtab.nochim.zam1 <- readRDS(here('data/seqtab_nochim_ZAM1.rds'))
+taxa.zam1 <- readRDS(here('data/tax_ZAM1.rds'))
+tree.zam1 <- readRDS(here('data/phy_tree_ZAM1.rds'))
+metadata.zam1 <- readRDS(here('data/metadata_ZAM1_full.rds'))
+seqtab.nochim.zam2 <- readRDS(here('data/seqtab_nochim_ZAM2.rds'))
+taxa.zam2 <- readRDS(here('data/tax_ZAM2.rds'))
+tree.zam2 <- readRDS(here('data/phy_tree_ZAM2.rds'))
+metadata.zam2 <- readRDS(here('data/metadata_ZAM2_full.rds'))
+tree.all <- readRDS(here('data/phy_tree.rds'))
+```
+
+```{r merge_metadata}
+# Merge metadata
+metadata.zam1$Study <- 'ZAM1'
+metadata.zam2$Study <- 'ZAM2'
+metadata.all <- base::merge(metadata.zam1, metadata.zam2, all = T)
+rownames(metadata.all) <- metadata.all$Sample
+metadata.all$agexdiet <- as.character(metadata.all$agexdiet)
+metadata.all$agexdiet[metadata.all$agexdiet == 'YMZD'] <- 'YZD'
+metadata.all$agexdiet[metadata.all$agexdiet == 'OMZD'] <- 'OZD'
+metadata.all$agexdiet <- factor(metadata.all$agexdiet)
+metadata.all <- metadata.all[order(metadata.all$Study, metadata.all$Timepoint,
+                                   metadata.all$host_subject_id),]
+metadata.all$host_subject_id <- paste(sep = '_', metadata.all$Study,
+                                      metadata.all$host_subject_id)
+metadata.all$agexstudy <- factor(paste(metadata.all$Age,
+                                            metadata.all$Study, sep= '_'))
+metadata.all$agexdietxweek <- factor(paste(metadata.all$Timepoint, 
+                                           metadata.all$agexdiet, sep = '_'))
+metadata.all$agexdietxstudy <- factor(paste(metadata.all$agexdiet,
+                                            metadata.all$Study, sep= '_'))
+colnames(metadata.all)[colnames(metadata.all) == 'Type'] <- 'Site'
+
+# Merge sequence and taxa tables; delete duplicates in taxa table
+seqtab.nochim.all <- dada2::mergeSequenceTables(seqtab.nochim.zam1, seqtab.nochim.zam2)
+taxa.all <- rbind(taxa.zam1, taxa.zam2)
+taxa.all <- taxa.all[!duplicated(rownames(taxa.all)),]
+
+# Convert to phyloseq obejct
+ps <- phyloseq(otu_table(seqtab.nochim.all, taxa_are_rows=FALSE),
+               sample_data(metadata.all),
+               tax_table(taxa.all), phy_tree(tree.all))
+
+# Convert names to arbitrary OTU names
+names.ps <- as.data.frame(cbind(taxa_names(ps),
+                                paste0("ASV", seq(ntaxa(ps)))),
+                          stringsAsFactors=F)
+colnames(names.ps) <- c('seq', 'asv')
+taxa_names(ps) <- names.ps$asv
+names.sample <- as.data.frame(cbind(sample_names(ps),
+                                    paste(sample_names(ps),
+                                    sample_data(ps)$agexdiet,
+                                    sep='_')), 
+                              stringsAsFactors=F)
+colnames(names.sample) <- c('orig', 'rename')
+sample_names(ps) <- names.sample$rename
+names.ps %>% write_tsv("ASVs.tab")
+ps %>% tax_table() %>% as.data.frame() %>% write_tsv("taxa.tab")
+
+# Convert metadata to appropriate types; this causes some string NA to convert to NA value
+metadata <- sample_data(ps)
+metadata$agexdietxstudy <- as.factor(metadata$agexdietxstudy)
+metadata$agexdietxweek <- as.factor(metadata$agexdietxweek)
+metadata$Sample <- names.sample$rename
+metadata$serum_zinc <- as.numeric(as.character(metadata$serum_zinc))
+metadata$wk6_plasma_MCP <- as.numeric(as.character(metadata$wk6_plasma_MCP))
+metadata$wk6_WB_LPS_IL6 <- as.numeric(as.character(metadata$wk6_WB_LPS_IL6))
+metadata$MLN_IL17 <- as.numeric(as.character(metadata$MLN_IL17))
+metadata$MLN_IFNg <- as.numeric(as.character(metadata$MLN_IFNg))
+metadata$MLN_CD4_naive <- as.numeric(sub("%", "", (as.character(metadata$MLN_CD4_naive))))
+metadata$Site <- as.character(metadata$Site)
+fecal <- which(metadata$Site == 'fecal')
+fecal_replacements <- paste0(metadata$Site[fecal], '_', 
+                               metadata$Timepoint[fecal])
+metadata$Site[fecal] <- fecal_replacements
+metadata$Site <- as.factor(metadata$Site)
+
+# Manually set order
+agexdietxstudy_order <- c('YZD_ZAM2', 'YZA_ZAM2', 'YZA_ZAM1', 'YZS_ZAM1',
+                          'OZD_ZAM2', 'OZA_ZAM2', 'OZA_ZAM1', 'OZS_ZAM1')
+metadata$agexdietxstudy <- factor(metadata$agexdietxstudy, levels = agexdietxstudy_order)
+sample_data(ps) <- metadata
+tax_table(ps) <- tax_table(cbind(tax_table(ps),
+                                 ASV = taxa_names(ps)))
+metadata.tbl <- metadata %>%
+  as_tibble()
+
+fcl <- c('fecal_wk0', 'fecal_wk6')
+ps <- ps %>% subset_samples(Site %in% fcl)
+```
+
+```{r export metadata for NCBI sra}
+metadata.tbl.ncbi <- metadata.tbl %>%
+  separate(Sample, c(NA, "sample_id", NA)) %>%
+  mutate(Sample = paste(Study, sample_id, sep="_")) %>%
+  mutate(organism = "metagenome",
+         collection_date = case_when(
+           Study == 'ZAM1' & Site == 'fecal_wk0' ~ "2018-04-17",
+           Study == 'ZAM1' & Site == 'fecal_wk6' ~ "2018-05-31",
+           Study == 'ZAM1' & Site %in% c('cecal', 'colon') ~ "2018-06-04",
+           Study == 'ZAM2' & Site == 'fecal_wk0' ~ "2018-08-23",
+           Study == 'ZAM2' & Site == 'fecal_wk6' ~ "2018-10-04",
+           Study == 'ZAM2' & Site %in% c('cecal', 'colon') ~ "2018-10-08",
+           TRUE ~ "NA"
+         ),
+         env_broad_scale = "not applicable",
+         env_local_scale = "not applicable",
+         env_medium = case_when(
+           Site %in% c("fecal_wk0", "fecal_wk6") ~ "feces",
+           Site == "cecal" ~ "cecum",
+           Site == "colon" ~ "colon"),
+         geo_loc_name = "USA: Oregon",
+         host = "Mus musculus",
+         lat_lon = "44.566612 N 123.278937 W",
+         host_age = case_when(
+           Age == 'young' & Timepoint == "wk0" ~ "2 months",
+           Age == 'young' & Timepoint == "wk6" ~ "3.5 months",
+           Age == 'old' & Timepoint == "wk0" ~ "24 months",
+           Age == 'old' & Timepoint == "wk6" ~ "25.5 months",
+           TRUE ~ "NA"
+         ),
+         host_body_product = "stool",
+         host_diet = paste("AIN-93G", Diet),
+         host_genotype = "C57Bl/6",
+         host_life_stage = Age,
+         host_sex = "male",
+         host_taxid = "10090",
+         host_tissue_sampled = env_medium,
+         misc_param = paste("whole blood LPS-induced IL6:", wk6_WB_LPS_IL6)
+         )
+metadata.tbl.ncbi %>%
+  rename(sample_name = "Sample") %>%
+  select(sample_name,
+         organism,
+         collection_date,
+         env_broad_scale,
+         env_local_scale,
+         env_medium,
+         geo_loc_name,
+         host,
+         lat_lon,
+         host_age,
+         host_diet,
+         host_genotype,
+         host_life_stage,
+         host_sex,
+         host_subject_id,
+         host_taxid,
+         host_tissue_sampled,
+         misc_param) %>%
+  write_tsv("metadata_ncbi.tsv")
+
+metadata.tbl.ncbi %>%
+  rename(sample_name = "Sample") %>%
+  select(sample_name, Age, env_medium) %>%
+  mutate(library_ID = sample_name,
+         title = paste("16S metabarcoding of Mus musculus:", Age, "male", env_medium),
+         library_strategy = "AMPLICON",
+         library_source = "METAGENOMIC",
+         library_selection = "PCR",
+         library_layout = "paired",
+         platform = "ILLUMINA",
+         instrument_model = "Illumina MiSeq",
+         design_description = "Earth Microbiome Project 16S PCR protocol",
+         filetype = "fastq",
+         filename = paste(sample_name, "R1.fastq.gz", sep = "_"),
+         filename2 = paste(sample_name, "R2.fastq.gz", sep = "_")) %>%
+  select(-c(Age, env_medium)) %>%
+  write_tsv("SRA_data.tsv")
+```
+
+
+```{r summary}
+removed_low_counts <- names(which(sample_sums(ps) < 25000))
+length(removed_low_counts)
+sample_sum_data <- data.frame(id = sample_names(ps), pre_filter = sample_sums(ps))
+taxa_sum_data <- data.frame(taxa = taxa_names(ps), pre_filter = taxa_sums(ps) > 0)
+# sample_sum_data
+ps.pruned <- ps %>%
+  subset_samples(sample_sums(ps) > 25000)
+richness_data <- estimate_richness(ps.pruned) %>% as_tibble(rownames = "Sample")
+ps %>% sample_data() %>%
+  data.frame() %>%
+  mutate(removed = ifelse(Sample %in% removed_low_counts, TRUE, FALSE)) %>%
+  write_delim("metadata.tab", "\t")
+sample_sum_data <- sample_sum_data %>%
+  merge(data.frame(id = sample_names(ps.pruned),
+                   low_count_removed = sample_sums(ps.pruned)),  
+        by = 'id',  all.x = TRUE)
+taxa_sum_data <- taxa_sum_data %>%
+  merge(data.frame(taxa = taxa_names(ps.pruned), 
+                   low_count_removed = taxa_sums(ps.pruned) > 0), 
+        by = 'taxa', all.x = TRUE)
+
+# remove zero count taxa
+keeps <- taxa_names(ps.pruned)[which(taxa_sums(ps.pruned) > 0)]
+ps.sub <- prune_taxa(keeps, ps.pruned)
+ps.sub.otus <- ps.sub %>% otu_table() %>% data.frame() %>% t()
+
+# remove Mitochondria, Chloroplast
+ps.sub <- ps.sub %>%
+  subset_taxa(
+    Kingdom %in% c('Bacteria', 'Archaea') &
+    !Family %in% c('Mitochondria') &
+    !Order %in% c('Chloroplast')
+  )
+
+sample_sum_data <- sample_sum_data %>%
+  merge(data.frame(id = sample_names(ps.sub),
+                   euk_contam_removed = sample_sums(ps.sub)),  
+        by = 'id',  all.x = TRUE)
+taxa_sum_data <- taxa_sum_data %>%
+  merge(data.frame(taxa = taxa_names(ps.sub), 
+                   euk_contam_removed = taxa_sums(ps.sub) > 0), 
+        by = 'taxa', all.x = TRUE)
+
+# Prevalence filtering to 5 samples
+prevThreshold <- 5
+
+# Compute prevalence of each feature, store as data.frame
+prevdf <- apply(X = otu_table(ps.sub),
+               MARGIN = ifelse(taxa_are_rows(ps.sub), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+
+# Add taxonomy and total read counts to this data.frame
+prevdf <- data.frame(Prevalence = prevdf,
+                    TotalAbundance = taxa_sums(ps.sub),
+                    tax_table(ps.sub))
+
+keepTaxa <- rownames(prevdf)[(prevdf$Prevalence >= prevThreshold)]
+removeTaxa <- rownames(prevdf)[(prevdf$Prevalence < prevThreshold)]
+ps2 <- prune_taxa(keepTaxa, ps.sub)
+ps2 %>% saveRDS("ps2.rds")
+ps2 %>% taxa_names() %>% write_lines("ASVs_for_tree.txt")
+tax_table(ps2) <- ps2 %>% tax_table() %>% data.frame() %>% 
+  mutate(Genus = ifelse(is.na(Genus), paste(Family, "Genus", ASV, sep="_"), Genus)) %>%
+  as.matrix.data.frame() %>%
+  tax_table()
+
+richness_plot <- richness_data %>% pivot_longer(!Sample, names_to="richness_measure") %>%
+  filter(richness_measure %in% c("Observed", "Shannon", "Simpson")) %>%
+  left_join(metadata.tbl) %>%
+  ggplot(aes(x = agexdietxstudy, y = value, fill = agexdietxstudy)) +
+  geom_boxplot() +
+  facet_wrap(~richness_measure, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_blank()) +
+  scale_fill_manual(values = agexdietxstudy_colors, name = "Age, Diet, Study") +
+  xlab('') 
+richness_plot %>% save_plot("richness_plot.png", .)
+
+removed_data <- data.frame(
+  removed = (ps %>% prune_taxa(removeTaxa, .) %>% sample_sums()),
+  total = (ps %>% sample_sums()),
+  Sample = (ps %>% sample_names())) %>%
+  as_tibble() %>%
+  mutate(perc = removed/total * 100)
+removed_data <- removed_data %>%
+  pivot_longer(c("removed", "total"))
+removed_data %>% ggplot(aes(Sample, value, fill = name)) + geom_col()
+
+# Compositional data
+ps2.comp <- ps2 %>%
+  transform_sample_counts(function(x) x/sum(x) * 100)
+ps2.comp.melt <- ps2.comp %>%
+  psmelt()
+```
+
+```{r clr ordinations}
+coda.otus <- ps2 %>%
+  otu_table() %>%
+  as.data.frame()
+coda.meta <- ps2 %>%
+  sample_data() %>%
+  data.frame()
+coda.taxa <- ps2 %>%
+  tax_table() %>%
+  data.frame()
+
+coda.otus.young <- coda.otus %>%
+  subset(coda.meta$Age == 'young')
+coda.meta.young <- coda.meta %>%
+  subset(Age == 'young')
+
+coda.otus.old <- coda.otus %>%
+  subset(coda.meta$Age == 'old')
+coda.meta.old <- coda.meta %>%
+  subset(Age == 'old')
+
+coda.otus.zam1 <- coda.otus %>%
+  subset(coda.meta$Study == 'ZAM1')
+coda.meta.zam1 <- coda.meta %>%
+  subset(Study == 'ZAM1')
+
+coda.otus.zam2 <- coda.otus %>%
+  subset(coda.meta$Study == 'ZAM2')
+coda.meta.zam2 <- coda.meta %>%
+  subset(Study == 'ZAM2')
+
+# Set up deicode directories
+rpca.dir <- here('rpca')
+
+# Loading deicode dir
+if (!dir.exists(paste(rpca.dir, 'fecal', sep = '-'))) {
+  rpca.dir.fecal <- run_deicode(coda.otus, "fecal")
+  rpca.dir.fecal.young <- run_deicode(coda.otus.young, "fecal-young")
+  rpca.dir.fecal.old <- run_deicode(coda.otus.old, "fecal-old")
+  rpca.dir.fecal.zam1 <- run_deicode(coda.otus.zam1, "fecal-zam1")
+  rpca.dir.fecal.zam2 <- run_deicode(coda.otus.zam2, "fecal-zam2")
+} else {
+  rpca.dir.fecal <- paste(rpca.dir, 'fecal', sep = '-')
+  rpca.dir.fecal.young <- paste(rpca.dir.fecal, "young", sep = "-")
+  rpca.dir.fecal.old <- paste(rpca.dir.fecal, "old", sep = "-")
+  rpca.dir.fecal.zam1 <- paste(rpca.dir.fecal, "zam1", sep = "-")
+  rpca.dir.fecal.zam2 <- paste(rpca.dir.fecal, "zam2", sep = "-")
+}
+
+# Reading deicode results
+rpca.ord.fecal <- 'ordination.txt' %>%
+  file.path(rpca.dir.fecal, .) %>%
+  read_rpca_ord(coda.meta, coda.taxa)
+rpca.dist.fecal <- 'distance-matrix.tsv' %>%
+  file.path(rpca.dir.fecal, .) %>%
+  read.csv(sep='\t', row.names=1) %>%
+  as.dist()
+rpca.ord.fecal.young <- 'ordination.txt' %>%
+  file.path(rpca.dir.fecal.young, .) %>%
+  read_rpca_ord(coda.meta, coda.taxa)
+rpca.dist.fecal.young <- 'distance-matrix.tsv' %>%
+  file.path(rpca.dir.fecal.young, .) %>%
+  read.csv(sep='\t', row.names=1) %>%
+  as.dist()
+rpca.ord.fecal.old <- 'ordination.txt' %>%
+  file.path(rpca.dir.fecal.old, .) %>%
+  read_rpca_ord(coda.meta.old, coda.taxa)
+rpca.dist.fecal.old <- 'distance-matrix.tsv' %>%
+  file.path(rpca.dir.fecal.old, .) %>%
+  read.csv(sep='\t', row.names=1) %>%
+  as.dist()
+rpca.ord.fecal.zam1 <- 'ordination.txt' %>%
+  file.path(rpca.dir.fecal.zam1, .) %>%
+  read_rpca_ord(coda.meta.zam1, coda.taxa)
+rpca.dist.fecal.zam1 <- 'distance-matrix.tsv' %>%
+  file.path(rpca.dir.fecal.zam1, .) %>%
+  read.csv(sep='\t', row.names=1) %>%
+  as.dist()
+rpca.ord.fecal.zam2 <- 'ordination.txt' %>%
+  file.path(rpca.dir.fecal.zam2, .) %>%
+  read_rpca_ord(coda.meta.zam2, coda.taxa)
+rpca.dist.fecal.zam2 <- 'distance-matrix.tsv' %>%
+  file.path(rpca.dir.fecal.zam2, .) %>%
+  read.csv(sep='\t', row.names=1) %>%
+  as.dist()
+```
+
+```{r rpca permanova and dispersion}
+# Full
+# Study effect (Fig S1)
+rpca.ord.fecal.adonis <- rpca.ord.fecal$sites %>%
+  vegan::adonis(rpca.dist.fecal ~ Study, data = .)
+rpca.ord.fecal.disper <- rpca.dist.fecal %>%
+  vegan::betadisper(rpca.ord.fecal$sites$Study) %>%
+  vegan::permutest()
+# Age effect (Fig 1)
+rpca.ord.fecal.adonis.age <- rpca.ord.fecal$sites %>%
+  vegan::adonis(rpca.dist.fecal ~ Age, data = .)
+rpca.ord.fecal.disper.age <- rpca.dist.fecal %>%
+  vegan::betadisper(rpca.ord.fecal$sites$Age) %>%
+  vegan::permutest()
+
+# Study-specific Age effect (Fig 1)
+rpca.ord.fecal.zam1.adonis <- rpca.ord.fecal.zam1$sites %>%
+  vegan::adonis(rpca.dist.fecal.zam1 ~ Age, data = .)
+rpca.ord.fecal.zam1.disper <- rpca.dist.fecal.zam1 %>%
+  vegan::betadisper(rpca.ord.fecal.zam1$sites$Age) %>%
+  vegan::permutest()
+rpca.ord.fecal.zam2.adonis <- rpca.ord.fecal.zam2$sites %>%
+  vegan::adonis(rpca.dist.fecal.zam2 ~ Age, data = .)
+rpca.ord.fecal.zam2.disper <- rpca.dist.fecal.zam2 %>%
+  vegan::betadisper(rpca.ord.fecal.zam2$sites$Age) %>%
+  vegan::permutest()
+
+# Age-specific Study effects (Fig S1)
+rpca.ord.fecal.young.adonis <- rpca.ord.fecal.young$sites %>%
+  vegan::adonis(rpca.dist.fecal.young ~ Study, data = .)
+rpca.ord.fecal.young.disper <- rpca.dist.fecal.young %>%
+  vegan::betadisper(rpca.ord.fecal.young$sites$Study) %>%
+  vegan::permutest()
+rpca.ord.fecal.old.adonis <- rpca.ord.fecal.old$sites %>%
+  vegan::adonis(rpca.dist.fecal.old ~ Study, data = .)
+rpca.ord.fecal.old.disper <- rpca.dist.fecal.old %>%
+  vegan::betadisper(rpca.ord.fecal.old$sites$Study) %>%
+  vegan::permutest()
+```
+
+```{r Figure 1}
+fig1.a <- plot_rpca_ord(rpca.ord.fecal.zam1, 
+                        flip_y_axis = TRUE,
+                        species = FALSE)
+fig1.b <- plot_rpca_ord(rpca.ord.fecal.zam2,
+                        species = FALSE)
+fig1.c <- plot_rpca_ord(rpca.ord.fecal,
+                        flip_y_axis = TRUE,
+                        species = FALSE)
+fig1.d.order <- coda.meta$Sample[order(coda.meta$Age,
+                                 coda.meta$Study,
+                                 decreasing = TRUE)]
+
+genus_bar <- ps2.comp %>%
+  plot_bar_top(taxa = 'Genus', 
+               x_label = '',
+               order_list = fig1.d.order,
+               blank_axis = TRUE,
+               cutoff = 90) 
+
+# set same coordinates
+limits <- data.frame(y = c(-0.35, 0.35),
+                     x = c(-0.25, 0.25))
+fig1.a.cow <- fig1.a$rpca.ord.plot +
+  ylim(limits$y) +
+  xlim(limits$x) 
+fig1.b.cow <- fig1.b$rpca.ord.plot +
+  ylim(limits$y) +
+  xlim(limits$x) 
+fig1.c.cow <- fig1.c$rpca.ord.plot +
+  ylim(limits$y) + 
+  xlim(limits$x)
+fig1.a.cow
+fig1.b.cow
+fig1.c.cow
+
+fig1.d.cow <- genus_bar +
+  ylab('Relative Abundance (%)') +
+  facet_wrap(~fct_relevel(Age, 'young', 'old'),
+             scales = 'free_x',
+             strip.position = 'bottom') +
+  theme(axis.ticks.x.bottom = element_blank(),
+        axis.text.x.bottom = element_blank(),
+        axis.ticks.x.top = element_blank(),
+        axis.text.y = element_text(size = 9),
+        panel.spacing = unit(0.01, 'npc'),
+        axis.title.y = element_text(size = 9),
+        strip.background = element_blank(),
+        strip.text.x = element_text(size=9),
+        strip.placement = "outside",
+        legend.text = element_text(size=9),
+        legend.title = element_text(size=10), 
+        legend.key.size = unit(9, 'pt')) +
+    guides(shape = guide_legend(override.aes = list(size = 1)),
+           color = guide_legend(override.aes = list(size = 1)))
+
+fig1.legend1.cow <- cowplot::get_legend(fig1.c.cow +
+                                          theme(legend.justification = 'left',
+                                                   legend.position = 'right',
+                                                   legend.title = element_blank(),
+                                                   legend.text = element_text(size=9)))
+fig1.legend2.cow <- cowplot::get_legend(fig1.d.cow +
+                                          theme(legend.justification = 'left',
+                                                   legend.position = 'right'))
+                                    
+fig1.cow <- plot_grid(fig1.a.cow + theme(legend.position = 'none',
+                                         axis.text = element_text(size=9),
+                                         axis.title = element_text(size=10)),
+          fig1.b.cow + theme(legend.position = 'none',
+                             axis.text = element_text(size=9),
+                             axis.title = element_text(size=10)), 
+          fig1.c.cow + theme(legend.position = 'none',
+                             axis.text = element_text(size=9),
+                             axis.title = element_text(size=10)), 
+          fig1.d.cow + theme(legend.position = 'none'),
+          labels = LETTERS[1:4], 
+          align = 'hv', axis = 'tlbr')
+fig1.legends.cow <- plot_grid(fig1.legend1.cow, fig1.legend2.cow,
+                              ncol = 1, align = 'hv', rel_heights = c(1,1.5))
+fig1.full.cow <- plot_grid(fig1.cow, fig1.legends.cow, rel_widths = c(2.75,0.80),
+                           align = 'hv', axis = 'tlbr')
+save_plot('Figure_1_2021208_cb.png', fig1.full.cow, base_height=6)
+```
+
+
+```{r wilcoxon and kruskal tests}
+frm.raw <- c('Abundance ~ Age')
+ps.nonpara <- ps2.comp
+genus_kruskal.res <- ps.nonpara %>%
+  tax_glom("Genus", NArm = F) %>%
+  psmelt() %>%
+  group_by(Genus) %>%
+  kruskal_test(formula(frm.raw)) %>%
+  adjust_pvalue(method="fdr") %>%
+  mutate(label = ifelse(p.adj < 0.05, '*', ''))
+
+genus_wilcox.res <- ps.nonpara %>%
+  tax_glom("Genus", NArm = F) %>%
+  psmelt() %>%
+  group_by(Genus) %>%
+  wilcox_test(formula(frm.raw),
+              p.adjust.method = "fdr",
+              ref.group = "old",
+              comparisons = list(c("old", "young"))
+              )  %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance("p.adj")
+
+genus_wilcox.res %>% write_tsv("genus_wilcox_res.tsv")
+
+phylum_wilcox.res <- ps.nonpara %>%
+  tax_glom("Phylum", NArm = F) %>%
+  psmelt() %>%
+  group_by(Phylum) %>%
+  wilcox_test(formula(frm.raw),
+              p.adjust.method = "fdr",
+              ref.group = "old",
+              comparisons = list(c("old", "young"))
+              )  %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance("p.adj")
+
+class_wilcox.res <- ps.nonpara %>%
+  tax_glom("Class", NArm = F) %>%
+  psmelt() %>%
+  group_by(Class) %>%
+  wilcox_test(formula(frm.raw),
+              p.adjust.method = "fdr",
+              ref.group = "old",
+              comparisons = list(c("old", "young"))
+              )  %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance("p.adj")
+
+order_wilcox.res <- ps.nonpara %>%
+  tax_glom("Order", NArm = F) %>%
+  psmelt() %>%
+  group_by(Order) %>%
+  wilcox_test(formula(frm.raw),
+              p.adjust.method = "fdr",
+              ref.group = "old",
+              comparisons = list(c("old", "young"))
+              )  %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance("p.adj")
+
+family_wilcox.res <- ps.nonpara %>%
+  tax_glom("Family", NArm = F) %>%
+  psmelt() %>%
+  group_by(Family) %>%
+  wilcox_test(formula(frm.raw),
+              p.adjust.method = "fdr",
+              ref.group = "old",
+              comparisons = list(c("old", "young"))
+              )  %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance("p.adj")
+
+frm.raw <- c('Abundance ~ Age')
+genus_wilcox.eff <- ps.nonpara %>%
+  tax_glom("Genus", NArm = F) %>%
+  psmelt() %>%
+  group_by(Genus) %>%
+  wilcox_effsize(
+              formula(frm.raw),
+              p.adjust.method = "fdr",
+              ref.group = "old",
+              comparisons = list(c("old", "young"))
+              ) 
+
+genus_wilcox.res.eff <- genus_wilcox.res %>%
+  left_join(genus_wilcox.eff)
+frm.raw <- c('Abundance ~ agexdietxstudy')
+genus_kruskal.res <- ps.nonpara %>%
+  tax_glom("Genus", NArm = F) %>%
+  psmelt() %>%
+  filter(Site == 'fecal_wk6') %>%
+  group_by(Genus, Age) %>%
+  kruskal_test(formula(frm.raw)) %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance("p.adj")
+genus_kruskal.res %>%
+  filter(!p.adj.signif %in% c("ns", ""))
+
+genus_kruskal_young.res <- ps.nonpara %>%
+  tax_glom("Genus", NArm = F) %>%
+  subset_samples(Age == 'young') %>%
+  psmelt() %>%
+  group_by(Genus) %>%
+  kruskal_test(formula(frm.raw)) %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance()
+
+genus_kruskal_young.res.sig <- genus_kruskal_young.res %>%
+  filter(!p.adj.signif %in% c("ns", ""))
+
+genus_kruskal_old.res <- ps.nonpara %>%
+  tax_glom("Genus", NArm = F) %>%
+  subset_samples(Age == 'old') %>%
+  psmelt() %>%
+  group_by(Genus) %>%
+  kruskal_test(formula(frm.raw)) %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance()
+
+genus_kruskal_old.res.sig <- genus_kruskal_old.res %>%
+  filter(!p.adj.signif %in% c("ns", ""))
+
+genus_kruskal_young.res.skips <- ps.nonpara %>%
+  tax_glom("Genus", NArm = F) %>%
+  subset_samples(Age == 'young') %>%
+  psmelt() %>%
+  group_by(Genus, agexdietxstudy) %>%
+  mutate(groupsum = sum(Abundance)) %>%
+  filter(groupsum == 0) %>%
+  pull(Genus) %>%
+  unique()
+genus_kruskal_young.res.sig.pairwise <- ps.nonpara %>%
+  tax_glom("Genus", NArm = F) %>%
+  subset_samples(Age == 'young') %>%
+  psmelt() %>%
+  group_by(Genus) %>%
+  filter(Genus %in% genus_kruskal_young.res.sig$Genus) %>%
+  filter(!Genus %in% genus_kruskal_young.res.skips) %>%
+  pairwise_wilcox_test(formula(frm.raw)) %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance()
+
+genus_kruskal_old.res.sig.pairwise <- ps.nonpara %>%
+  tax_glom("Genus", NArm = F) %>%
+  subset_samples(Age == 'old') %>%
+  psmelt() %>%
+  group_by(Genus) %>%
+  filter(Genus %in% genus_kruskal_old.res.sig$Genus) %>%
+  pairwise_wilcox_test(formula(frm.raw)) %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance()
+
+# wk0 to wk6 comparisons
+host_keeps <- coda.meta %>%
+  pull(host_subject_id) %>%
+  table() %>%
+  data.frame() %>%
+  filter(Freq == 2) %>%
+  pluck('.')
+ps.nonpara.genus.df <- ps.nonpara %>%
+  tax_glom("Genus", NArm = F) %>% 
+  psmelt()
+
+genus_wilcox_weekly <- ps.nonpara.genus.df %>%
+  filter(host_subject_id %in% host_keeps) %>%
+  group_by(Genus, agexdietxstudy) %>%
+  wilcox_test(Abundance ~ Site, paired = TRUE) %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance()
+
+# print results
+
+genus_kruskal_young.res.sig
+genus_kruskal_old.res.sig
+genus_kruskal_young.res.sig.pairwise
+genus_kruskal_old.res.sig.pairwise %>% filter(!p.adj.signif %in% c("", "ns"))
+genus_wilcox_weekly %>% filter(!p.adj.signif %in% c("", "ns"))
+```
+
+```{r figure 2}
+fig2 <- bar_plot_facet(ps.nonpara,
+               primary='Age',
+               rank='genus',
+               grouped = 'agexdietxstudy',
+               secondary='agexdietxstudy',
+               cutoff = 0.5,
+               plot_cutoff = 0.5,
+               col_pal = cb_pal.12)
+
+primary_order_list <- c('old', 'young')
+fig2.box <- box_plot_facet(ps.nonpara,
+               primary='Age',
+               rank='genus',
+               cutoff = 0.5,
+               plot_cutoff = 0.5)
+ylabpos <- c(11, 13, 6, 5, 18, 11, 21, 21, 28, 60, 100, 105)
+
+genus_include <- fig2.box$data %>% pull("Genus") %>% unique() %>% as.character()
+genus_wilcox.res.eff.include <- genus_wilcox.res.eff %>%
+  filter(Genus %in% genus_include)
+genus_wilcox.res.eff.order <- fig2.box$data %>% pull(Genus) %>% levels() %>% tail(12)
+genus_wilcox.res.eff.include.pos <- genus_wilcox.res.eff.include %>%
+  mutate(Genus = factor(Genus, levels = genus_wilcox.res.eff.order)) %>%
+  arrange(Genus) %>%
+  mutate(y.position = ylabpos)
+
+ps.unfilt <- ps
+tax_table(ps.unfilt) <- ps.unfilt %>% 
+  tax_table() %>% 
+  data.frame() %>% 
+  mutate(Genus = ifelse(is.na(Genus), 
+                        paste(Family, "Genus", ASV, sep="_"),
+                        Genus)) %>%
+  as.matrix.data.frame() %>%
+  tax_table()
+
+# Confirm that filtered dataset was not filtered too much
+fig2.box.unfiltered <- (box_plot_facet(ps.unfilt,
+               primary='Age',
+               rank='genus',
+               cutoff = 0.45,
+               plot_cutoff = 0.45)) %>%
+  pluck('data') %>%
+  mutate(Age = relevel(Age, 'young')) %>%
+  ggboxplot(x = 'Age',
+            y = 'Abundance',
+            color = 'agexdietxstudy',
+            add = 'jitter',
+            ylab = "Relative Abundance (%)",
+            xlab = FALSE) %>%
+  facet('Genus', scales = 'free_y') +
+  scale_y_continuous(expand = c(0.2,0)) +
+  scale_color_manual(values = agexdietxstudy_colors, name = 'Age, Diet, Study') +
+  coord_cartesian(clip = "off") +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        legend.position = "top")
+save_plot("Figure_2_box_unfiltered.png", fig2.box.unfiltered, base_height = 7, base_asp = 1.33)
+  
+
+fig2.box.labs <- fig2.box$data %>%
+  mutate(Age = relevel(Age, 'young')) %>%
+  ggboxplot(x = 'Age',
+            y = 'Abundance',
+            color = 'agexdietxstudy',
+            add = 'jitter',
+            ylab = "Relative Abundance (%)",
+            xlab = FALSE) %>%
+  facet('Genus', scales = 'free_y') +
+  scale_y_continuous(expand = c(0.2,0)) +
+  stat_pvalue_manual(genus_wilcox.res.eff.include.pos, label = "p.adj.signif", hide.ns = TRUE) + 
+  scale_color_manual(values = agexdietxstudy_colors, name = 'Age, Diet, Study') +
+  coord_cartesian(clip = "off") +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        legend.position = "top")
+save_plot("Figure_2_box.png", fig2.box.labs, base_height = 7, base_asp = 1.33)
+```
+
+```{r wilcox table}
+wilcox_summary <- phylum_wilcox.res %>%
+  summarize(level = "Phylum",
+            n = nrow(.),
+            sig = length(which(p.adj < 0.05)))
+wilcox_summary <- rbind(
+  wilcox_summary,
+  (class_wilcox.res %>%
+  summarize(level = "Class",
+            n = nrow(.),
+            sig = length(which(p.adj < 0.05))))
+  )
+wilcox_summary <- rbind(
+  wilcox_summary,
+  (order_wilcox.res %>%
+  summarize(level = "Order",
+            n = nrow(.),
+            sig = length(which(p.adj < 0.05))))
+  )
+wilcox_summary <- rbind(
+  wilcox_summary,
+  (family_wilcox.res %>%
+  summarize(level = "Family",
+            n = nrow(.),
+            sig = length(which(p.adj < 0.05))))
+  )
+wilcox_summary <- rbind(
+  wilcox_summary,
+  (genus_wilcox.res %>%
+  summarize(level = "Genus",
+            n = nrow(.),
+            sig = length(which(p.adj < 0.05))))
+  )
+wilcox_summary %>% write_csv("wilcox_sumary.csv")
+wilcox_summary
+```
+
+
+```{r Figure S1 - young & old dispersion analysis}
+figS1.a <- plot_rpca_ord(rpca.ord.fecal, species = F,
+                         flip_y_axis = T,
+                         fill = 'agexdietxstudy',
+                         ann_colors = agexdietxstudy_colors) %>%
+  pluck('rpca.ord.plot')
+figS1.b <- plot_rpca_ord(rpca.ord.fecal.young, species = F,
+                         fill = 'agexdietxstudy',
+                         ann_colors = agexdietxstudy_colors) %>%
+  pluck('rpca.ord.plot')
+figS1.c <- plot_rpca_ord(rpca.ord.fecal.old, species = F,
+                         fill = 'agexdietxstudy',
+                         ann_colors = agexdietxstudy_colors) %>%
+  pluck('rpca.ord.plot')
+
+# Study effects/dispersion
+rpca.ord.fecal.adonis$aov.tab
+rpca.ord.fecal.disper
+rpca.ord.fecal.young.adonis$aov.tab
+rpca.ord.fecal.young.disper
+rpca.ord.fecal.old.adonis$aov.tab
+rpca.ord.fecal.old.disper
+
+rpca.ord.fecal.disper.dat <- rpca.dist.fecal %>%
+  betadisper(rpca.ord.fecal$sites$Study) %>%
+  pluck('distances') %>%
+  data.frame(dispersion = .) %>%
+  as_tibble(rownames = 'Sample') %>%
+  right_join(rpca.ord.fecal$sites)
+rpca.ord.fecal.young.disper.dat <- rpca.dist.fecal.young %>%
+  betadisper(rpca.ord.fecal.young$sites$Study) %>%
+  pluck('distances') %>%
+  data.frame(dispersion = .) %>%
+  as_tibble(rownames = 'Sample') %>%
+  right_join(rpca.ord.fecal.young$sites)
+rpca.ord.fecal.old.disper.dat <- rpca.dist.fecal.old %>%
+  betadisper(rpca.ord.fecal.old$sites$Study) %>%
+  pluck('distances') %>%
+  data.frame(dispersion = .) %>%
+  as_tibble(rownames = 'Sample') %>%
+  right_join(rpca.ord.fecal.old$sites)
+
+figS1.d <- rpca.ord.fecal.disper.dat %>%
+  ggplot(aes(x = Study, y = dispersion, 
+             )) +
+  geom_boxplot() +
+  theme_cowplot() +
+  theme(legend.title = element_blank(),
+        axis.title.x = element_blank(),
+        # axis.text.x = element_blank(),
+        ) +
+  scale_fill_manual(values = agexdietxstudy_colors) +
+  scale_color_manual(values = agexdietxstudy_colors) 
+
+figS1.e <- rpca.ord.fecal.young.disper.dat %>%
+  ggplot(aes(x = Study, y = dispersion,
+             )) +
+  geom_boxplot() +
+  theme_cowplot() +
+  theme(legend.title = element_blank(),
+        axis.title.x = element_blank(),
+        # axis.text.x = element_blank(),
+        ) +
+  scale_fill_manual(values = agexdietxstudy_colors) +
+  scale_color_manual(values = agexdietxstudy_colors) 
+
+figS1.f <- rpca.ord.fecal.old.disper.dat %>%
+  ggplot(aes(x = Study, y = dispersion,
+             )) +
+  geom_boxplot() +
+  theme_cowplot() +
+  theme(legend.title = element_blank(),
+        axis.title.x = element_blank(),
+        # axis.text.x = element_blank(),
+        ) +
+  scale_fill_manual(values = agexdietxstudy_colors) +
+  scale_color_manual(values = agexdietxstudy_colors)
+
+# PERMANOVA for significance of variation per term
+rpca.ord.fecal.adonis$aov.tab
+rpca.ord.fecal.young.adonis$aov.tab
+rpca.ord.fecal.old.adonis$aov.tab
+# permutest to detect differences in dispersion
+rpca.ord.fecal.disper
+rpca.ord.fecal.young.disper
+rpca.ord.fecal.old.disper
+
+# get pvals
+rpca.ord.fecal.disper.study.pval <- rpca.ord.fecal.disper %>% 
+  magrittr::extract2('tab') %>%
+  as_tibble(rownames = 'term') %>%
+  filter(term == 'Groups') %>%
+  pull(`Pr(>F)`)
+rpca.ord.fecal.young.disper.study.pval <- rpca.ord.fecal.young.disper %>% 
+  magrittr::extract2('tab') %>%
+  as_tibble(rownames = 'term') %>%
+  filter(term == 'Groups') %>%
+  pull(`Pr(>F)`)
+rpca.ord.fecal.old.disper.study.pval <- rpca.ord.fecal.old.disper %>% 
+  magrittr::extract2('tab') %>%
+  as_tibble(rownames = 'term') %>%
+  filter(term == 'Groups') %>%
+  pull(`Pr(>F)`)
+
+# cowplot
+figS1.legend <- cowplot::get_legend(figS1.a + theme(legend.title = element_blank()))
+
+figS1.top <- plot_grid(figS1.a + theme(legend.position = 'none'), 
+          figS1.b + theme(legend.position = 'none'),
+          figS1.c + theme(legend.position = 'none'),
+          nrow = 1,
+          labels = c('A', 'B', 'C'))
+figS1.bottom <- plot_grid(
+  figS1.d + 
+  annotate('text', x = 1.5, y = 0,
+           label = paste0('p-value = ',rpca.ord.fecal.disper.study.pval)),
+  figS1.e + 
+  annotate('text', x = 1.5, y = 0,
+           label = paste0('p-value = ',rpca.ord.fecal.young.disper.study.pval)),
+  figS1.f + 
+  annotate('text', x = 1.5, y = 0,
+           label = paste0('p-value = ',rpca.ord.fecal.old.disper.study.pval)),
+  nrow = 1, 
+  labels = c('D', 'E', 'F'))
+
+figS1 <- plot_grid(
+  plot_grid(figS1.top, figS1.bottom, nrow = 2),
+  figS1.legend,
+  nrow = 1, rel_widths = c(5, 1))
+figS1
+save_plot('Figure_S1.png', figS1, base_height = 6, base_asp = 2)
+```
+
+```{r upset_plot_shared_ASVs}
+# Supplemental Shared ASV plot?
+ps2.venn <- ps2 %>%
+  merge_samples('agexdietxstudy', fun = sum)
+venn_obj <- ps2.venn %>%
+  otu_table() %>%
+  t() %>%
+  as.data.frame()
+venn_obj.binary <- venn_obj %>%
+  sapply(function(x) ifelse(x > 0, 1, 0),
+                          USE.NAMES = T)
+rownames(venn_obj.binary) <- rownames(venn_obj)
+venn_obj.binary <- as.data.frame(venn_obj.binary)
+upset_order <- colnames(venn_obj.binary)
+shared_ASV_plot <- UpSetR::upset(venn_obj.binary, nsets = 6,
+      sets = rev(agexdietxstudy_order),
+      mainbar.y.label = 'Shared ASVs',
+      sets.x.label = 'ASVs per Group',
+      keep.order = T,
+      order.by = 'freq', nintersects = 10,
+      sets.bar.color = c(rev(agexdietxstudy_colors[1:4]),
+                         rev(agexdietxstudy_colors[5:8])))
+png("upset_plot.png", width=1080, height=640, res = 160)
+shared_ASV_plot
+dev.off()
+```
+
+```{r run claatu}
+# run claatu
+phytree.fh <- here("data/new_phy_tree.nwk")
+claatu_venv_dir <- "~/claatu"
+outpath <- here("claatu")
+run_claatu(phytree.fh, ps2, outpath)
+```
+
+```{r read claatu}
+ctu.counts <- read.table(here("claatu", "counts_rare.tab"), sep = "\t")
+meta <- ps2 %>% sample_data() %>% data.frame()
+ctu_tax <- read_tsv(here("claatu", "tax_clades.txt"),
+                    col_names = c("node", "taxonomy"))
+
+ctu.counts <- ctu.counts %>% 
+  as_tibble(rownames = 'Sample')
+ctu.counts.melt <- meta %>%
+  left_join(ctu.counts) %>%
+  reshape2::melt(id.vars = 1:17,
+                 variable.name = 'node',
+                 value.name = 'Abundance') %>%
+  mutate(node = naturalsort::naturalfactor(node)) %>%
+  arrange(node) %>%
+  left_join(ctu_tax)
+```
+
+```{r claatu analysis}
+run.glm.nb <- function(dat, frm) {
+  do.call(glm.nb,
+          list(formula(frm),
+               data = dat)
+  )
+}
+
+run.kruskal <- function(dat, frm) {
+  do.call(kruskal_test,
+          list(data = dat,
+               formula(frm))
+  )
+}
+
+run.glmer.nb <- function(dat, frm) {
+  do.call(glmer.nb,
+          list(formula(frm),
+               data = dat)
+  )
+}
+
+frm.raw <- c('Abundance ~ Diet + (1 | host_subject_id)')
+cnmf <- ctu.counts.melt
+
+cnmf.res <- cnmf %>%
+  mutate(agexstudy = paste0(Age, '_', Study)) %>%
+  group_by(agexstudy, node) %>%
+  nest() %>%
+  mutate(frm = frm.raw) %>%
+  ungroup() %>%
+  mutate(res.glmer.nb = future_map2(
+    data, frm, 
+    possibly(run.glmer.nb,
+             NA_character_,
+             quiet = FALSE),
+    .progress = TRUE)
+  )
+
+cnmf.res <- cnmf.res %>%
+  mutate(agexstudyxnode = paste(agexstudy, node, sep="x"))
+saveRDS(cnmf.res, 'cnmf.res.rds')
+cnmf.res.ttest <- cnmf.res %>%
+  filter(map_lgl(res.glmer.nb, ~ !is_character(.))) %>%
+  group_by(agexstudy, node) %>%
+  group_modify(~ {
+    tbl_ttest <- .x %>% pluck('res.glmer.nb', 1) %>%
+    summary() %>%
+    coef() %>%
+    as_tibble(rownames = 'term')
+  }) %>%
+  rename(estimate = 'Estimate',
+         std.error = 'Std. Error',
+         z.value = 'z value',
+         p.value = 'Pr(>|z|)',
+         node = 'node') %>%
+  ungroup() %>%
+  mutate(p.adj = p.adjust(p.value, method = 'fdr')) %>%
+  mutate(label = ifelse(p.adj < 0.05, '*', '')) %>%
+  arrange(node) %>%
+  left_join(ctu_tax)
+
+cnmf.res.ttest <- cnmf.res.ttest %>%
+  mutate(agexstudyxnode = paste(
+    agexstudy, node, sep='x'))
+nodes.skips <- cnmf.res.ttest %>%
+  filter(term == '(Intercept)' & estimate < 0) %>%
+  pull(agexstudyxnode)
+
+
+cnmf.res.ttest.sig <- cnmf.res.ttest %>%
+  filter(!agexstudyxnode %in% nodes.skips) %>%
+  arrange(desc(abs(estimate))) %>%
+  filter(term != "(Intercept)" & label == '*') %>%
+  mutate(node = naturalsort::naturalfactor(node)) %>%
+  mutate(ptitle = paste(node, taxonomy, estimate, agexstudy, p.adj,
+                 sep = ';'))
+cnmf.res.ttest.sig.nodes <- cnmf.res.ttest.sig %>%
+  pull(node) %>%
+  as.character()
+cnmf.res.ttest.sig %>% filter(node == cnmf.res.ttest.sig.nodes[1])
+
+dietxstudy_levels <- c("deficientxZAM2", "adequatexZAM2", "adequatexZAM1", "supplementedxZAM1")
+pdf(here("ctu_abd_plots.pdf"))
+for(i in 1:length(cnmf.res.ttest.sig.nodes)){
+p <-cnmf %>%
+  filter(node == cnmf.res.ttest.sig.nodes[i]) %>%
+  mutate(nodextaxonomy = paste0(node, ';', taxonomy)) %>%
+  mutate(Age = relevel(Age, 'young')) %>%
+  mutate(dietxstudy = paste0(Diet, 'x', Study)) %>%
+  mutate(dietxstudy = factor(dietxstudy, levels = dietxstudy_levels)) %>%
+  ggplot(aes(x = dietxstudy, y = Abundance, color = agexdietxstudy)) +
+  geom_boxplot() +
+  geom_point() +
+  ggtitle(paste0(cnmf.res.ttest.sig$node[i], 
+                 ';', 
+                 cnmf.res.ttest.sig$taxonomy[i],
+                 ';',
+                 cnmf.res.ttest.sig$estimate[i],
+                 ';',
+                 cnmf.res.ttest.sig$agexstudy[i],
+                 ';',
+                 cnmf.res.ttest.sig$p.adj[i])) +
+  scale_color_manual(values = agexdietxstudy_colors) +
+  theme_bw() +
+  facet_grid(Age~Timepoint, scales = "free") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+print(p)
+}
+dev.off()
+
+frm.raw <- c('Abundance ~ Age')
+
+cnmf.age.res <- cnmf %>%
+  mutate(agexstudy = paste0(Age, '_', Study)) %>%
+  group_by(node) %>%
+  nest() %>%
+  mutate(frm = frm.raw) %>%
+  ungroup() %>%
+  mutate(res.glm.nb = future_map2(
+    data, frm, 
+    possibly(run.glm.nb,
+             NA_character_,
+             quiet = TRUE),
+    .progress = TRUE)
+  )
+
+cnmf.age.res.ttest <- cnmf.age.res %>%
+  filter(map_lgl(res.glm.nb, ~ !is_character(.))) %>%
+  group_by(node) %>%
+  group_modify(~ {
+    tbl_ttest <- .x %>% pluck('res.glm.nb', 1) %>%
+    summary() %>%
+    coef() %>%
+    as_tibble(rownames = 'term')
+  }) %>%
+  rename(estimate = 'Estimate',
+         std.error = 'Std. Error',
+         z.value = 'z value',
+         p.value = 'Pr(>|z|)',
+         node = 'node') %>%
+  ungroup() %>%
+  mutate(p.adj = p.adjust(p.value, method = 'fdr')) %>%
+  mutate(label = ifelse(p.adj < 0.05, '*', '')) %>%
+  mutate(node = naturalsort::naturalfactor(node)) %>%
+  arrange(node) %>%
+  left_join(ctu_tax)
+
+node.age.skips <- cnmf.age.res.ttest %>%
+  filter(term == '(Intercept)' & estimate < 0) %>%
+  pull(node)
+cnmf.age.res.ttest.tables3 <- cnmf.age.res %>%
+  filter(map_lgl(res.glm.nb, ~ !is_character(.))) %>%
+  group_by(node) %>%
+  group_modify(~ {
+    tbl_ttest <- .x %>% pluck('res.glm.nb', 1) %>%
+    summary() %>%
+    coef() %>%
+    as_tibble(rownames = 'term')
+  }) %>%
+  rename(estimate = 'Estimate',
+         std.error = 'Std. Error',
+         z.value = 'z value',
+         p.value = 'Pr(>|z|)',
+         node = 'node') %>%
+  ungroup() %>%
+  mutate(exclude = if_else(node %in% node.age.skips, 'negative intercept', '')) %>%
+  adjust_pvalue(method="fdr") %>%
+  add_significance() %>%
+  mutate(node = naturalsort::naturalfactor(node)) %>%
+  arrange(node) %>%
+  left_join(ctu_tax)
+cnmf.age.res.ttest.tables3 %>% write_tsv("TableS3.tsv")
+```
+
+```{r claatu analysis no wk0 by age; inflammation}
+frm.raw <- c('Abundance ~ wk6_WB_LPS_IL6')
+cnminfage.wk6 <- ctu.counts.melt %>%
+  filter(Site == 'fecal_wk6')
+
+cnminfage.wk6.res <- cnminfage.wk6 %>%
+  mutate(agexstudy = paste0(Age, '_', Study)) %>%
+  group_by(Age, node) %>%
+  nest() %>%
+  mutate(frm = frm.raw) %>%
+  ungroup() %>%
+  mutate(res.glm.nb = future_map2(
+    data, frm, 
+    possibly(run.glm.nb,
+             NA_character_,
+             quiet = FALSE),
+    .progress = TRUE)
+  )
+
+saveRDS(cnminfage.wk6.res, "cnminfage.wk6.res.rds")
+cnminfage.wk6.res.ttest <- cnminfage.wk6.res %>%
+  filter(map_lgl(res.glm.nb, ~ !is_character(.))) %>%
+  group_by(Age, node) %>%
+  group_modify(~ {
+    tbl_ttest <- .x %>% pluck('res.glm.nb', 1) %>%
+    summary() %>%
+    coef() %>%
+    as_tibble(rownames = 'term')
+  }) %>%
+  rename(estimate = 'Estimate',
+         std.error = 'Std. Error',
+         z.value = 'z value',
+         p.value = 'Pr(>|z|)',
+         node = 'node') %>%
+  ungroup() %>%
+  mutate(p.adj = p.adjust(p.value, method = 'fdr')) %>%
+  mutate(label = ifelse(p.adj < 0.05, '*', '')) %>%
+  arrange(node) %>%
+  left_join(ctu_tax)
+
+
+cnminfage.wk6.res.ttest.sig.skips <- cnminfage.wk6.res.ttest %>%
+  filter(term == "(Intercept)" & estimate < 0) %>%
+  pull(node) %>%
+  as.character()
+cnminfage.wk6.res.ttest.sig <- cnminfage.wk6.res.ttest %>%
+  filter(term != "(Intercept)" & label == '*') %>%
+  filter(! node %in% cnminfage.wk6.res.ttest.sig.skips) %>%
+  mutate(node = naturalsort::naturalfactor(node)) %>%
+  arrange(desc(abs(estimate))) %>% head(n=50)
+cnminfage.wk6.res.ttest.sig.nodes <- cnminfage.wk6.res.ttest.sig %>%
+  pull(node) %>%
+  as.character()
+cnminfage.wk6.res.ttest %>% filter(node == cnminfage.wk6.res.ttest.sig.nodes[1])
+
+cnminfage.wk6.res.ttest %>% filter(label == '*' & term != "(Intercept)")
+cnminfage.wk6.res.ttest %>% filter(label == '*' & term != "(Intercept)") %>%
+  pull(node) %>% n_distinct()
+
+cnminfage.wk6.res.ttest.sig %>%
+  filter(node %in% cnminfage.wk6.res.ttest.sig.skips)
+
+dietxstudy_levels <- c("deficientxZAM2", "adequatexZAM2", "adequatexZAM1", "supplementedxZAM1")
+pdf(here("ctu_abd_plots_inf_wk6_byage_top50.pdf"))
+for(i in 1:length(cnminfage.wk6.res.ttest.sig.nodes)){
+p <- cnminfage.wk6 %>%
+  filter(node == cnminfage.wk6.res.ttest.sig.nodes[i]) %>%
+  mutate(nodextaxonomy = paste0(node, ';', taxonomy)) %>%
+  mutate(Age = relevel(Age, 'young')) %>%
+  mutate(dietxstudy = paste0(Diet, 'x', Study)) %>%
+  mutate(dietxstudy = factor(dietxstudy, levels = dietxstudy_levels)) %>%
+  ggplot(aes(x = wk6_WB_LPS_IL6, y = Abundance, color = agexdietxstudy)) +
+  geom_point() +
+  ggtitle(paste0(cnminfage.wk6.res.ttest.sig$node[i], 
+                 ';', 
+                 cnminfage.wk6.res.ttest.sig$taxonomy[i],
+                 ';',
+                 cnminfage.wk6.res.ttest.sig$estimate[i],
+                 ';',
+                 cnminfage.wk6.res.ttest.sig$Age[i],
+                 ';',
+                 cnminfage.wk6.res.ttest.sig$p.adj[i]
+                 )) +
+  scale_color_manual(values = agexdietxstudy_colors) +
+  theme_bw() +
+  facet_grid(Age~Timepoint, scales = "free")
+print(p)
+}
+dev.off()
+```
+
+
+```{r claatu overlap diet & inf}
+# writing tables for Holly
+cnmf.res.ttest.sig %>% write_tsv(here("claatu_sig_diets.tsv"))
+cnminfage.wk6.res.ttest.sig %>% write_tsv(here("claatu_sig_IL6.tsv"))
+ps2 %>%
+  tax_table() %>% 
+  data.frame() %>% 
+  write.table(here("ctu_tax_table.tsv"), sep = "\t", quote=F)
+
+ps2.comp.family <- ps2.comp %>%
+  tax_glom("Family") %>%
+  psmelt()
+
+(ps2.comp.family %>%
+  ggplot(aes(x = agexdietxstudy, y = Abundance, fill = agexdietxstudy)) +
+  geom_boxplot() +
+  theme_bw() +
+  theme(axis.text.x = element_blank()) + 
+  scale_fill_manual(values = agexdietxstudy_colors) +
+  facet_wrap(~Family, scales = "free")) %>%
+  save_plot("family_boxplot.png", ., base_height=9)
+```
+
+```{r manuscript}
+node.age.skips <- cnmf.age.res.ttest %>%
+  filter(term == '(Intercept)' & estimate < 0) %>%
+  pull(node)
+cnmf.age.res.ttest %>%
+  filter(term != "(Intercept)") %>%
+  filter(label == '*') %>%
+  filter(! node %in% node.age.skips) %>%
+  arrange(desc(abs(estimate))) %>%
+  select(node, estimate, taxonomy)
+cnmf.res.ttest.sig %>%
+  filter(term == 'Dietsupplemented')
+```
